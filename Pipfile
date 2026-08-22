@@ -6,6 +6,8 @@ name = "pypi"
 [packages]
 dataclasses = "*"
 torch = "*"
+transformers = "*"
+tiktoken = "*"
 
 [dev-packages]
 
