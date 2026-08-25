@@ -15,6 +15,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # creates a matrix capabale of holding query, key, and value by dims * 3
         # Output projection matrix
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -36,7 +37,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # k.transpose(-2, -1) -> (B, 6, 64, T) thus we have matmul (B, 6, T, 64) @ (B, 6, 64, T)
+        '''# k.transpose(-2, -1) -> (B, 6, 64, T) thus we have matmul (B, 6, T, 64) @ (B, 6, 64, T)
         # only last two dims participate giving every query i dotted with key j, in head h
         # scaled as in the paper
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -48,7 +49,11 @@ class CausalSelfAttention(nn.Module):
 
         # (B, 6, T, T) @ (B, 6, T, 64) -> (B, 6, T, 64)
         # Convex combination of vectors weighted by attention
-        y = att @ v
+        y = att @ v'''
+
+        # replaces the above commented code, allows torch.compile to realise flashattention should be called
+        # TODO read flash-attention paper
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # Undoes earlier permutation, back to (B, T, 6, 64) then flattens 6x64 into 384
         # Contiguous is called to allocate a new buffer with elements in row-major order so that view is compatible
@@ -64,6 +69,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approximate='tanh') # tanh approximation used within gpt2 paper, GELU is a smoother RELU
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     # projects up to 4* dims of n_embd, through gelu and then back down the n_embd dims
     def forward(self, x):
@@ -88,6 +94,8 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+# --------------------------------------------------------------
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -110,7 +118,26 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # linear map converts embedding space into vocab space
 
-    def forward(self, idx):
+        # linear map and wte matrix are the same matrix in gpt2
+        # -> Done as both have similar goals, wte takes tokens to embeddings, lm wants to find a token closest to the embedding it wants to say
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # init params
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        # initialised in accordance with gpt2
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5 # scale in gpt2 paper to keep std at 1
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
 
@@ -127,7 +154,11 @@ class GPT(nn.Module):
         # forward the final layernorm and classifier
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
-        return logits
+        loss = None
+        if targets is not None:
+            # flattening B and T to BxT to get two dims (BxT, vocab_size)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -178,11 +209,37 @@ class GPT(nn.Module):
 
         return model
 
-num_return_sequences = 5
-max_length = 30
+# -------------------------------------------------------
+import tiktoken
 
-model = GPT(GPTConfig())
-model.eval()
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+
+        self.current_position = 0
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # input data
+        y = (buf[1:]).view(B, T) # label / target data
+        self.current_position += B*T
+        if self.current_position + (B*T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+# --------------------------------------------------------
+
+import time
 
 device = 'cpu'
 if torch.cuda.is_available():
@@ -190,17 +247,55 @@ if torch.cuda.is_available():
 elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print(f"using device: {device}")
+device = "cpu" # override
 
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+train_loader = DataLoaderLite(B=4, T=256)
+
+# TODO - enable this for cuda
+#torch.set_float32_matmul_precision('high')
+
+# get logits
+# artificially increase the number of tokens to go from ugly 50257 to nice 50304, cuda has kernels that work in chunks of nice numbers so special case handling needed
+# this leads to larger but nice computation which in the long run is faster, harmless as adds tokens which aren't found by tokeniser which only has 50257 tokens
+# these extra tokens will never be used and their probability will drop to zero
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+model = torch.compile(model) # does what it says on the tin, compiles the program so pytorch doesnt have to run in "eager" mode
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    optimizer.zero_grad() # set gradients to 0, gradients deposited via +=
+    # TODO enable for cuda - with torch.autocast(device_type=device, dtype=torch.bfloat16): # cast to lower precision for faster runtime on ampere
+    logits, loss = model(x, y) # TODO tab in so nested in autocast for cuda
+    loss.backward()
+    optimizer.step()
+    torch.cpu.synchronize() # TODO needs to be changed to .cuda before training on nvidia
+    t1 = time.time()
+    dt = (t1 - t0)*1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tokens_sec: {tokens_per_sec:.2f}hz")
+
+print(loss)
+
+import sys; sys.exit(0)
+
+model.eval()
+num_return_sequences = 5
+max_length = 30
+
 tokens = enc.encode("Hello, I'm a dumb language model")
 tokens = torch.tensor(tokens, dtype=torch.long)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
 x = tokens.to(device)
 
-# generate tokens
+# get logits, get tokens
 torch.manual_seed(42)
 while x.size(1) < max_length:
     # forward the model to get logits
