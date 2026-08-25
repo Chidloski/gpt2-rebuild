@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 class CausalSelfAttention(nn.Module):
     bias: torch.Tensor
@@ -209,6 +210,29 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # all parameters which require grad
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # only weight decay parameters which should be, e.g biases and layernorms aren't weight decayed
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create the AdamW optimizer and used fused versions if it is available
+        # fused is a speedup which instead of launching many gpu kernels to update parameter tensors, it does it in a singular kernel handling many tensors at once
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
 # -------------------------------------------------------
 import tiktoken
 
@@ -253,7 +277,16 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(B=4, T=256)
+# Due to such a large batch size, we must run gradient accumulation to run the batch partly sequentially
+total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper
+B = 16
+T = 1024
+assert total_batch_size % (B * T) == 0, "batch size divisible by B*T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"Total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 # TODO - enable this for cuda
 #torch.set_float32_matmul_precision('high')
@@ -266,21 +299,58 @@ model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 model = torch.compile(model) # does what it says on the tin, compiles the program so pytorch doesnt have to run in "eager" mode
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+# learning rate scheduler
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+# according to gpt3 paper we have:
+# 1. Linear warmup over first 375 million tokens
+# 2. Cosine decay to 10% of original lr value over 260 billion tokens
+# 3. Training continues after this at 10% of original lr
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    if it > max_steps:
+        return min_lr
+
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # lr follows the slope of a cosine graph from 0 to pi
+    return min_lr + coeff * (max_lr - min_lr)
+
+
+#optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) # hyperparams according to gpt3
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad() # set gradients to 0, gradients deposited via +=
-    # TODO enable for cuda - with torch.autocast(device_type=device, dtype=torch.bfloat16): # cast to lower precision for faster runtime on ampere
-    logits, loss = model(x, y) # TODO tab in so nested in autocast for cuda
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # TODO enable for cuda - with torch.autocast(device_type=device, dtype=torch.bfloat16): # cast to lower precision for faster runtime on ampere
+        logits, loss = model(x, y) # TODO tab in so nested in autocast for cuda
+        # the loss in each step is averaged and thus if we simply added the loss of each micro-step we would be summing averages
+        # to get the true average we divide each micro-step's loss by number of micro-steps to re-average the loss
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    # clipping the norm according to gpt3's paper, the norm is the length of the vector containing the gradient of all parameters
+    # clipping this preserves the direction but stops large magnitude updates from shocking the model, potentially due to bad data within a batch
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # get learning rate
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups: # sets the learning rate for all parameter groups within the optimiser
+        param_group['lr'] = lr
     optimizer.step()
     torch.cpu.synchronize() # TODO needs to be changed to .cuda before training on nvidia
     t1 = time.time()
-    dt = (t1 - t0)*1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
-    print(f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, tokens_sec: {tokens_per_sec:.2f}hz")
+    dt = t1 - t0
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step}, loss: {loss_accum.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, dt: {dt:.2f}ms, tokens_sec: {tokens_per_sec:.2f}hz")
 
 print(loss)
 
