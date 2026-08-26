@@ -8,6 +8,7 @@ dataclasses = "*"
 torch = "*"
 transformers = "*"
 tiktoken = "*"
+datasets = "*"
 
 [dev-packages]
 
