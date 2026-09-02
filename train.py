@@ -315,7 +315,7 @@ else:
     elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
         device = 'mps'
     print(f"using device: {device}")
-    device = 'cpu' # override
+    # device = 'cpu' # override
 
 # device is "cuda:0" under ddp but "cuda" otherwise; device_type is the kind of device,
 # which is what autocast wants. defined outside the if/else so both paths have it.
@@ -327,12 +327,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 # Due to such a large batch size, we must run gradient accumulation to run the batch partly sequentially
-'''total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper
+total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper
 B = 16
-T = 1024'''
+T = 1024
+""" CPU VALUES
 total_batch_size = 4096
 B = 16
-T = 128
+T = 128"""
 assert total_batch_size % (B * T * ddp_world_size) == 0, "batch size divisible by B*T"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -342,17 +343,18 @@ if master_process:
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
 
-# TODO - enable this for cuda
-#torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision('high')
 
 # create model
 # artificially increase the number of tokens to go from ugly 50257 to nice 50304, cuda has kernels that work in chunks of nice numbers so special case handling needed
 # this leads to larger but nice computation which in the long run is faster, harmless as adds tokens which aren't found by tokeniser which only has 50257 tokens
 # these extra tokens will never be used and their probability will drop to zero
-#model = GPT(GPTConfig(vocab_size=50304))
-model = GPT(GPTConfig(vocab_size=50304, n_layer=6, n_head=6, n_embd=384, block_size=128)) # model shrunk for cpu run
+model = GPT(GPTConfig(vocab_size=50304))
+
+# model = GPT(GPTConfig(vocab_size=50304, n_layer=6, n_head=6, n_embd=384, block_size=128)) # model shrunk for cpu run
+
 model.to(device)
-if device == 'cuda':
+if device_type == 'cuda':
     model = torch.compile(model) # does what it says on the tin, compiles the program so pytorch doesnt have to run in "eager" mode
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -361,10 +363,11 @@ raw_model = model.module if ddp else model # always contains the unwrapped model
 # learning rate scheduler
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-"""warmup_steps = 715
-max_steps = 19073"""
+warmup_steps = 715 # derived as 375e6 / 524288, linear warmup over first 375M tokens
+max_steps = 19073 # derived as 10e9 / 524288, one pass over 10B token dataset
+""" CPU VALUES
 warmup_steps = 32
-max_steps = 4096
+max_steps = 4096"""
 # according to gpt3 paper we have:
 # 1. Linear warmup over first 375 million tokens
 # 2. Cosine decay to 10% of original lr value over 260 billion tokens
@@ -475,7 +478,7 @@ for step in range(max_steps):
     for param_group in optimizer.param_groups: # sets the learning rate for all parameter groups within the optimiser
         param_group['lr'] = lr
     optimizer.step()
-    torch.cpu.synchronize() # TODO needs to be changed to .cuda before training on nvidia
+    torch.cuda.synchronize() # needs switching to cpu for cpu runs
     t1 = time.time()
     dt = t1 - t0
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
