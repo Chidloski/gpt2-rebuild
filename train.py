@@ -6,6 +6,20 @@ import math
 import inspect
 import os
 
+# taken from meta's llama 3 repo
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim)) # params initialised to one means RMSNorm is initially a pure normalisation
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x) # computes in fp32 and casts back, bf16 only has 8 bit mantissa so squaring in it makes precision worse
+        return output * self.weight
+
 class CausalSelfAttention(nn.Module):
     bias: torch.Tensor
 
@@ -14,9 +28,9 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0
 
         # Holds W_q, W_k, W_v, to allow for one big matmul
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # creates a matrix capabale of holding query, key, and value by dims * 3
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False) # creates a matrix capabale of holding query, key, and value by dims * 3
         # Output projection matrix
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
         self.n_head = config.n_head
@@ -68,9 +82,9 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.gelu = nn.GELU(approximate='tanh') # tanh approximation used within gpt2 paper, GELU is a smoother RELU
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     # projects up to 4* dims of n_embd, through gelu and then back down the n_embd dims
@@ -84,16 +98,16 @@ class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(config.n_embd) # layer normal 1, before attention
+        self.attention_norm = RMSNorm(config.n_embd, config.norm_eps) # normal before attention
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd) # layer normal 2, before mlp
+        self.ffn_norm = RMSNorm(config.n_embd, config.norm_eps) # normal before mlp
         self.mlp = MLP(config)
 
     # forward prop, adds both the attention and mlp back into the token
     # path is purely additive to allow for easier gradient flow
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.attention_norm(x))
+        x = x + self.mlp(self.ffn_norm(x))
         return x
 
 # --------------------------------------------------------------
@@ -105,6 +119,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    norm_eps: float = 1e-5
 
 class GPT(nn.Module):
 
@@ -116,13 +131,9 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd), # token embeddings
             wpe = nn.Embedding(config.block_size, config.n_embd), # position embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # gives blocks for each of the layers within the transformer
-            ln_f = nn.LayerNorm(config.n_embd), # final normalisation after final self-attention block as stated in gpt2-paper
+            norm = RMSNorm(config.n_embd, config.norm_eps), # final normalisation after final self-attention block as stated in gpt2-paper
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # linear map converts embedding space into vocab space
-
-        # linear map and wte matrix are the same matrix in gpt2
-        # -> Done as both have similar goals, wte takes tokens to embeddings, lm wants to find a token closest to the embedding it wants to say
-        self.transformer.wte.weight = self.lm_head.weight
 
         # init params
         self.apply(self._init_weights)
@@ -134,8 +145,6 @@ class GPT(nn.Module):
             if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5 # scale in gpt2 paper to keep std at 1
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
@@ -154,7 +163,7 @@ class GPT(nn.Module):
             x = block(x)
 
         # forward the final layernorm and classifier
-        x = self.transformer.ln_f(x)
+        x = self.transformer.norm(x)
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
