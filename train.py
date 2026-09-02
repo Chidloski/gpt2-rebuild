@@ -331,8 +331,8 @@ if torch.cuda.is_available():
 B = 16
 T = 1024'''
 total_batch_size = 4096
-B = 8
-T = 256
+B = 16
+T = 128
 assert total_batch_size % (B * T * ddp_world_size) == 0, "batch size divisible by B*T"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
 if master_process:
@@ -350,7 +350,7 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 # this leads to larger but nice computation which in the long run is faster, harmless as adds tokens which aren't found by tokeniser which only has 50257 tokens
 # these extra tokens will never be used and their probability will drop to zero
 #model = GPT(GPTConfig(vocab_size=50304))
-model = GPT(GPTConfig(vocab_size=50304, n_layer=6, n_head=6, n_embd=384, block_size=256)) # model shrunk for cpu run
+model = GPT(GPTConfig(vocab_size=50304, n_layer=6, n_head=6, n_embd=384, block_size=128)) # model shrunk for cpu run
 model.to(device)
 if device == 'cuda':
     model = torch.compile(model) # does what it says on the tin, compiles the program so pytorch doesnt have to run in "eager" mode
@@ -363,8 +363,8 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 """warmup_steps = 715
 max_steps = 19073"""
-warmup_steps = 20
-max_steps = 400
+warmup_steps = 32
+max_steps = 4096
 # according to gpt3 paper we have:
 # 1. Linear warmup over first 375 million tokens
 # 2. Cosine decay to 10% of original lr value over 260 billion tokens
@@ -388,7 +388,7 @@ for step in range(max_steps):
     t0 = time.time()
 
     # check validation loss
-    if step % 50 == 0:
+    if step % 50 == 0 or step == max_steps - 1:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
@@ -411,11 +411,11 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
                 
     # generate samples, apparently throws a scary error when used with torch.compile()
-    if step > 0 and step % 50 == 0: # and False: TODO uncomment when using torch.compile() and change 10 to 100
+    if (step > 0 and step % 50 == 0) or step == max_steps - 1: # and False: TODO uncomment when using torch.compile() and change 10 to 100
         model.eval()
         num_return_sequences = 4
         max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = enc.encode("To be or not to be ")
         tokens = torch.tensor(tokens, dtype=torch.long)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
         xgen = tokens.to(device)
