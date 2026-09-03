@@ -20,9 +20,40 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x) # computes in fp32 and casts back, bf16 only has 8 bit mantissa so squaring in it makes precision worse
         return output * self.weight
 
-class CausalSelfAttention(nn.Module):
-    bias: torch.Tensor
+# precomputers the rotations for each position
+def precompute_freqs_cis(dim, end, theta=10000.0):
+    # for each even index (rotation happens in pairs), get base^(-2i/d)
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end)
+    # outer product pairs every position with every frequency, allowing angle to be computed easily
+    freqs = torch.outer(t, freqs)
+    # torch.polar returns cos + isin from polar coordinates
+    return torch.polar(torch.ones_like(freqs), freqs)
 
+# freqs_cis is (T, 32), xq_ is (B, T, n_head, 32) thus we need to reshape
+def reshape_for_broadcast(freqs_cis, x):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    # for each of the 4 dimensions, keep the size (T) at position 1 and at the last position, everything else is collapsed to 1
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+# rope applies the positional embeddings only where necessary, just before attention in the query and key matrices
+# it does this by rotating each vector, it chops the vector into 2d pairs and rotates each by a different frequency
+# this means that positions are relative rather than absolute
+def apply_rotary_emb(xq, xk, freqs_cis):
+    # reshapes from (B, T, nh, 64) -> (B, t, nh, 32, 2) for complex numbers
+    # viewing as complex thus gives (B, t, nh, 32)
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    # xq_ * freqs_cis give the rotation, view_as_real gets back to (B, T, nh, 32, 2), flatten gets back to (B, T, nh, 64)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -36,36 +67,19 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-        # register buffer to show it holds state not a parameter, no gradient and ignored by optimiser
-        # tril gives lower-triangular matrix of 1s which is broadcasted across batch and head due to leading singleton dims
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size)) # historically called bias in paper, though it is a mask
-
-    def forward(self, x):
+    def forward(self, x, freqs_cis):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2) # splits qkv into chunks of size 384 (chunk for each q, k, v)
 
         # transpose makes batch and head the leading dimensions so matmul batches over them automatically
-        # view splits the 384 channels into 6 contiguous blocks of 64, one for each attention head
-        # gives shape (B, 6, T, 64), thus batch and attention n_head comes first
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # view splits the 768 channels into 12 contiguous blocks of 64, one for each attention head
+        # gives shape (B, 12, T, 64), thus batch and attention n_head comes first
+        k = k.view(B, T, self.n_head, C // self.n_head)
+        q = q.view(B, T, self.n_head, C // self.n_head)
+        q, k = apply_rotary_emb(q, k, freqs_cis)
+        q,k = q.transpose(1, 2), k.transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        '''# k.transpose(-2, -1) -> (B, 6, 64, T) thus we have matmul (B, 6, T, 64) @ (B, 6, 64, T)
-        # only last two dims participate giving every query i dotted with key j, in head h
-        # scaled as in the paper
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-
-        # crops the mask to sequence length, if j > i (mask is 0) then a future token is influencing a past token
-        # the score then becomes -inf as tokens only influenced by their predecessors
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-
-        # (B, 6, T, T) @ (B, 6, T, 64) -> (B, 6, T, 64)
-        # Convex combination of vectors weighted by attention
-        y = att @ v'''
 
         # replaces the above commented code, allows torch.compile to realise flashattention should be called
         # TODO read flash-attention paper
@@ -82,17 +96,20 @@ class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.gelu = nn.GELU(approximate='tanh') # tanh approximation used within gpt2 paper, GELU is a smoother RELU
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        hidden = 4 * config.n_embd
+        hidden = int(2 * hidden / 3) # shrink width to keep param count the same as using gelu (without dim_multiplier)
+        if config.ffn_dim_multiplier is not None:
+            hidden = int(config.ffn_dim_multiplier * hidden)
+        hidden = config.multiple_of * ((hidden + config.multiple_of - 1) // config.multiple_of) # round up to nearest multiple
 
-    # projects up to 4* dims of n_embd, through gelu and then back down the n_embd dims
+        self.w1 = nn.Linear(config.n_embd, hidden, bias=False)
+        self.w3 = nn.Linear(config.n_embd, hidden, bias=False)
+        self.w2 = nn.Linear(hidden, config.n_embd, bias=False)
+        self.w2.NANOGPT_SCALE_INIT = 1
+
+    # projects up to 4* dims of n_embd, through swiglu and then back down the n_embd dims
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class Block(nn.Module):
 
@@ -105,8 +122,8 @@ class Block(nn.Module):
 
     # forward prop, adds both the attention and mlp back into the token
     # path is purely additive to allow for easier gradient flow
-    def forward(self, x):
-        x = x + self.attn(self.attention_norm(x))
+    def forward(self, x, freqs_cis):
+        x = x + self.attn(self.attention_norm(x), freqs_cis)
         x = x + self.mlp(self.ffn_norm(x))
         return x
 
@@ -120,6 +137,9 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     norm_eps: float = 1e-5
+    ffn_dim_multiplier: float | None = 1.3
+    multiple_of: int = 1024
+    rope_theta: float = 500000.0
 
 class GPT(nn.Module):
 
@@ -129,11 +149,12 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), # token embeddings
-            wpe = nn.Embedding(config.block_size, config.n_embd), # position embeddings
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # gives blocks for each of the layers within the transformer
             norm = RMSNorm(config.n_embd, config.norm_eps), # final normalisation after final self-attention block as stated in gpt2-paper
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # linear map converts embedding space into vocab space
+
+        self.register_buffer("freqs_cis", precompute_freqs_cis(config.n_embd // config.n_head, config.block_size, config.rope_theta), persistent=False,)
 
         # init params
         self.apply(self._init_weights)
@@ -152,15 +173,11 @@ class GPT(nn.Module):
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
 
-        # forward the position and token embeddings
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        pos_emb = self.transformer.wpe(pos) # shape (T, n_emb)
-        tok_emb = self.transformer.wte(idx) # shape (B, T, n_emb)
-        x = tok_emb + pos_emb
+        x = self.transformer.wte(idx)
+        freqs_cis = self.freqs_cis[:T]
 
-        # forward the transformer blocks
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, freqs_cis)
 
         # forward the final layernorm and classifier
         x = self.transformer.norm(x)
