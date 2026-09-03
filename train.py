@@ -57,40 +57,48 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-
-        # Holds W_q, W_k, W_v, to allow for one big matmul
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False) # creates a matrix capabale of holding query, key, and value by dims * 3
-        # Output projection matrix
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        assert config.n_head % config.n_kv_head == 0
 
         self.n_head = config.n_head
-        self.n_embd = config.n_embd
+        self.n_kv_head = config.n_kv_head
+        self.n_rep = config.n_head // config.n_kv_head
+        self.head_dim = config.n_embd // config.n_head
+
+        self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False) # more queries than k or v due to gqa
+        self.wk = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
+        self.wv = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
+        self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
+        self.wo.NANOGPT_SCALE_INIT = 1
+
+    def repeat_kv(self, x, n_rep):
+        bs, slen, n_kv_heads, head_dim = x.shape
+        if n_rep == 1:
+            return x
+        # takes 4 kv heads and fans them out into 12
+        # (B, T, 4, 64) -> (B, T, 4, 1, 64)
+        # expand: (B, T, 4, 1, 64) -> (B, T, 4, 3, 64)
+        # reshape: (B, T, 12, 64)
+        return (
+            x[:, :, :, None, :].expand(bs, slen, n_kv_heads, n_rep, head_dim).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+        )
 
     def forward(self, x, freqs_cis):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2) # splits qkv into chunks of size 384 (chunk for each q, k, v)
+        q = self.wq(x).view(B, T, self.n_head, self.head_dim) # transforms (4, 64, 768) -> (4, 64, 12, 64)
+        k = self.wk(x).view(B, T, self.n_kv_head, self.head_dim) # k and v both do (4, 64, 256) -> (4, 64, 4, 64)
+        v = self.wv(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # transpose makes batch and head the leading dimensions so matmul batches over them automatically
-        # view splits the 768 channels into 12 contiguous blocks of 64, one for each attention head
-        # gives shape (B, 12, T, 64), thus batch and attention n_head comes first
-        k = k.view(B, T, self.n_head, C // self.n_head)
-        q = q.view(B, T, self.n_head, C // self.n_head)
         q, k = apply_rotary_emb(q, k, freqs_cis)
-        q,k = q.transpose(1, 2), k.transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # replaces the above commented code, allows torch.compile to realise flashattention should be called
-        # TODO read flash-attention paper
+        k = self.repeat_kv(k, self.n_rep) # fans out the matrix to match the query shape
+        v = self.repeat_kv(v, self.n_rep)
+
+        # transform to (4, 12, 64, 64) so heads are at the front
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-        # Undoes earlier permutation, back to (B, T, 6, 64) then flattens 6x64 into 384
-        # Contiguous is called to allocate a new buffer with elements in row-major order so that view is compatible
+        # revert to (4, 64, 768)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y) # Combines the outputs from all heads
-
-        return y
+        return self.wo(y)
 
 class MLP(nn.Module):
 
@@ -140,6 +148,7 @@ class GPTConfig:
     ffn_dim_multiplier: float | None = 1.3
     multiple_of: int = 1024
     rope_theta: float = 500000.0
+    n_kv_head: int = 4
 
 class GPT(nn.Module):
 
