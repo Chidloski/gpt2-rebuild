@@ -1,10 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, asdict, replace
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
 import inspect
 import os
+import argparse
 
 # taken from meta's llama 3 repo
 class RMSNorm(torch.nn.Module):
@@ -269,6 +270,76 @@ class DataLoaderLite:
             self.current_position = self.B * self.T * self.process_rank
         return x, y
 
+@dataclass
+class TrainConfig:
+    run_name: str = "run"
+    out_dir: str = "log"
+    data_root: str = "edu_fineweb10B"
+    # shape
+    n_layer: int = 12
+    n_head: int = 12
+    n_kv_head: int = 4
+    n_embd: int = 768
+    block_size: int = 1024
+    vocab_size: int = 50304
+    multiple_of: int = 256
+    ffn_dim_multiplier: float | None = None
+    rope_theta: float = 500000.0
+    norm_eps: float = 1e-5
+    # batching
+    total_batch_size: int = 524288
+    B: int = 16
+    T: int = 1024
+    # optimisation
+    max_lr: float = 6e-4
+    min_lr_ratio: float = 0.1
+    warmup_steps: int = 715
+    max_steps: int = 19073
+    weight_decay: float = 0.1
+    grad_clip: float = 1.0
+    # cadence
+    eval_every: int = 250
+    eval_steps: int = 20
+    sample_every: int = 250
+    checkpoint_every: int = 1000
+    # misc
+    seed: int = 1337
+    compile: bool = True
+    resume: str = ""
+
+PRESETS = {
+    "llama-124m": {}, # default TrainConfig values
+    "smoke": dict(run_name="smoke", B=8, total_batch_size=8*1024*4, warmup_steps=10,
+                  max_steps=200, eval_every=50, sample_every=0, checkpoint_every=50),
+    "cpu": dict(run_name="cpu", n_layer=6, n_head=6, n_kv_head=2, n_emb=384,
+                block_size=256, multiple_of=256, total_batch_size=4096, B=8, T=256,
+                warmup_steps=20, max_steps=8000, eval_every=50, sample_every=50,
+                checkpoint_every=100, compile=False),
+}
+
+def _opt_float(s):
+    return None if s.lower() in ("none", "null", "") else float(s)
+
+def build_config_from_cli(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--preset", choices=sorted(PRESETS), default="llama-124m")
+    for f in fields(TrainConfig):
+        flag = "--" + f.name.replace("_", "-")
+        if f.type is bool:
+            parser.add_argument(flag, action=argparse.BooleanOptionalAction, default=None)
+        elif f.type in (int, float, str):
+            parser.add_argument(flag, type=f.type, default=None)
+        else:
+            parser.add_argument(flag, type=_opt_float, default=None)
+    args = parser.parse_args(argv)
+
+    cfg = replace(TrainConfig(), **PRESETS[args.preset])
+    # overrides any preset fields which have been changed in CLI
+    # knows which are changed as flags are all defaulted to None
+    overrides = {f.name: getattr(args, f.name) for f in fields(TrainConfig) if getattr(args, f.name) is not None}
+    return replace(cfg, **overrides), overrides
+
+
 # --------------------------------------------------------
 if __name__ == '__main__':
     import time
@@ -312,15 +383,15 @@ if __name__ == '__main__':
     if torch.cuda.is_available():
         torch.cuda.manual_seed(1337)
 
-    # Due to such a large batch size, we must run gradient accumulation to run the batch partly sequentially
-    total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper
-    B = 16
-    T = 1024
-    """ CPU VALUES
-    total_batch_size = 4096
-    B = 16
-    T = 128"""
+    cfg, overrides = build_config_from_cli()
+
+    '''# Due to such a large batch size, we must run gradient accumulation to run the batch partly sequentially
+    total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper'''
+    total_batch_size = cfg.total_batch_size
+    B = cfg.B
+    T = cfg.T
     assert total_batch_size % (B * T * ddp_world_size) == 0, "batch size divisible by B*T"
+
     grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
     if master_process:
         print(f"Total desired batch size: {total_batch_size}")
@@ -335,7 +406,8 @@ if __name__ == '__main__':
     # artificially increase the number of tokens to go from ugly 50257 to nice 50304, cuda has kernels that work in chunks of nice numbers so special case handling needed
     # this leads to larger but nice computation which in the long run is faster, harmless as adds tokens which aren't found by tokeniser which only has 50257 tokens
     # these extra tokens will never be used and their probability will drop to zero
-    model = GPT(GPTConfig(vocab_size=50304))
+    model = GPT(GPTConfig(vocab_size=50304, n_layer=cfg.n_layer, n_head=cfg.n_head, n_kv_head=cfg.n_kv_head, 
+                          n_embd=cfg.n_embd, block_size=cfg.block_size, multiple_of=cfg.multiple_of))
 
     # model = GPT(GPTConfig(vocab_size=50304, n_layer=6, n_head=6, n_embd=384, block_size=128)) # model shrunk for cpu run
 
@@ -347,13 +419,10 @@ if __name__ == '__main__':
     raw_model = model.module if ddp else model # always contains the unwrapped model
 
     # learning rate scheduler
-    max_lr = 6e-4
-    min_lr = max_lr * 0.1
-    warmup_steps = 715 # derived as 375e6 / 524288, linear warmup over first 375M tokens
-    max_steps = 19073 # derived as 10e9 / 524288, one pass over 10B token dataset
-    """ CPU VALUES
-    warmup_steps = 32
-    max_steps = 4096"""
+    max_lr = cfg.max_lr
+    min_lr = max_lr * cfg.min_lr_ratio
+    warmup_steps = cfg.warmup_steps
+    max_steps = cfg.max_steps
     # according to gpt3 paper we have:
     # 1. Linear warmup over first 375 million tokens
     # 2. Cosine decay to 10% of original lr value over 260 billion tokens
@@ -464,7 +533,12 @@ if __name__ == '__main__':
         for param_group in optimizer.param_groups: # sets the learning rate for all parameter groups within the optimiser
             param_group['lr'] = lr
         optimizer.step()
-        torch.cuda.synchronize() # needs switching to cpu for cpu runs
+        if device_type == "cuda":
+            torch.cuda.synchronize()
+        elif device_type == "mps":
+            torch.mps.synchronize()
+        else:
+            torch.cpu.synchronize()
         t1 = time.time()
         dt = t1 - t0
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size

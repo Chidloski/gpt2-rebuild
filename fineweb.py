@@ -17,11 +17,8 @@ from tqdm import tqdm # pip install tqdm
 # ------------------------------------------
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e6) #TODO restore to 1e8 for gpu run # 1M tokens per shard, ~2MB each on disk (uint16)
-target_shards = 2 #TODO change to 10 for gpu run # stop after this many shards (10 x 100M = ~1B tokens, ~2GB)
-
-# create the cache the local directory if it doesn't exist yet
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
+shard_size = int(1e8) #TODO restore to 1e8 for gpu run # 1M tokens per shard, ~2MB each on disk (uint16)
+target_shards = 100 #TODO change to 10 for gpu run # stop after this many shards (10 x 100M = ~1B tokens, ~2GB)
 
 # init the tokenizer
 # NOTE: everything above and including tokenize() must stay at module level. macOS
@@ -42,7 +39,8 @@ def tokenize(doc):
 def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
 
-def main():
+def main(local_dir, shard_size, target_shards):
+    DATA_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), local_dir)
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
     # download the dataset
@@ -94,4 +92,10 @@ def main():
             write_datafile(filename, all_tokens_np[:token_count])
 
 if __name__ == '__main__':
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local-dir", type=str, default="edu_fineweb10B")
+    parser.add_argument("--shard-size", type=int, default=int(1e8))
+    parser.add_argument("--target-shards", type=int, default=100)
+    args = parser.parse_args()
+    main(args.local_dir, args.shard_size, args.target_shards)
