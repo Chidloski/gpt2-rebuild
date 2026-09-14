@@ -232,7 +232,7 @@ def load_tokens(filename):
     return ptt
 
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, data_root, verbose=False):
         self.B = B
         self.T = T
         self.process_rank = process_rank
@@ -240,14 +240,13 @@ class DataLoaderLite:
         assert split in {'train', 'val'}
 
         # get shard names
-        data_root = "edu_fineweb10B"
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
         shards = [os.path.join(data_root, s) for s in shards]
         self.shards = shards
         assert len(shards) > 0, f"no shards found for split {split}"
-        if master_process:
+        if verbose:
             print(f"found {len(shards)} shards for split {split}")
         self.reset()
 
@@ -311,7 +310,7 @@ PRESETS = {
     "llama-124m": {}, # default TrainConfig values
     "smoke": dict(run_name="smoke", B=8, total_batch_size=8*1024*4, warmup_steps=10,
                   max_steps=200, eval_every=50, sample_every=0, checkpoint_every=50),
-    "cpu": dict(run_name="cpu", n_layer=6, n_head=6, n_kv_head=2, n_emb=384,
+    "cpu": dict(run_name="cpu", n_layer=6, n_head=6, n_kv_head=2, n_embd=384,
                 block_size=256, multiple_of=256, total_batch_size=4096, B=8, T=256,
                 warmup_steps=20, max_steps=8000, eval_every=50, sample_every=50,
                 checkpoint_every=100, compile=False),
@@ -379,11 +378,11 @@ if __name__ == '__main__':
     device_type = "cuda" if device.startswith("cuda") else device
     use_amp = (device_type == "cuda") # used to gate autocast, autocast buys little time on cpu runs of small models
 
-    torch.manual_seed(1337)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(1337)
-
     cfg, overrides = build_config_from_cli()
+
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(cfg.seed)
 
     '''# Due to such a large batch size, we must run gradient accumulation to run the batch partly sequentially
     total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper'''
@@ -397,8 +396,8 @@ if __name__ == '__main__':
         print(f"Total desired batch size: {total_batch_size}")
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", data_root=cfg.data_root, verbose=master_process)
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", data_root=cfg.data_root, verbose=master_process)
 
     torch.set_float32_matmul_precision('high')
 
@@ -406,17 +405,27 @@ if __name__ == '__main__':
     # artificially increase the number of tokens to go from ugly 50257 to nice 50304, cuda has kernels that work in chunks of nice numbers so special case handling needed
     # this leads to larger but nice computation which in the long run is faster, harmless as adds tokens which aren't found by tokeniser which only has 50257 tokens
     # these extra tokens will never be used and their probability will drop to zero
-    model = GPT(GPTConfig(vocab_size=50304, n_layer=cfg.n_layer, n_head=cfg.n_head, n_kv_head=cfg.n_kv_head, 
-                          n_embd=cfg.n_embd, block_size=cfg.block_size, multiple_of=cfg.multiple_of))
-
-    # model = GPT(GPTConfig(vocab_size=50304, n_layer=6, n_head=6, n_embd=384, block_size=128)) # model shrunk for cpu run
+    gpt_field_names = {f.name for f in fields(GPTConfig)}
+    model_cfg = GPTConfig(**{k: v for k, v in asdict(cfg).items() if k in gpt_field_names})
+    model = GPT(model_cfg)
 
     model.to(device)
-    if device_type == 'cuda':
+    orig_model = model
+
+    if master_process:
+        print(f"config: {cfg}")
+        if overrides:
+            print(f"CLI overrides: {overrides}")
+        n_params = sum(p.numel() for p in model.parameters())
+        n_emb = model_cfg.vocab_size * model_cfg.n_embd * 2   # wte + untied lm_head
+        print(f"model: {n_params/1e6:.1f}M params ({(n_params-n_emb)/1e6:.1f}M non-embedding), "
+              f"ffn={model.transformer.h[0].mlp.w1.out_features}, "
+              f"grad_accum={grad_accum_steps}")
+
+    if cfg.compile and device_type == 'cuda':
         model = torch.compile(model) # does what it says on the tin, compiles the program so pytorch doesnt have to run in "eager" mode
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
-    raw_model = model.module if ddp else model # always contains the unwrapped model
 
     # learning rate scheduler
     max_lr = cfg.max_lr
@@ -440,18 +449,18 @@ if __name__ == '__main__':
 
 
     #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) # hyperparams according to gpt3
-    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+    optimizer = orig_model.configure_optimizers(weight_decay=cfg.weight_decay, learning_rate=cfg.max_lr, device=device)
 
     for step in range(max_steps):
         t0 = time.time()
 
         # check validation loss
-        if step % 50 == 0 or step == max_steps - 1:
+        if cfg.eval_every and (step % cfg.eval_every == 0 or step == max_steps - 1):
             model.eval()
             val_loader.reset()
             with torch.no_grad():
                 val_loss_accum = 0.0
-                val_loss_steps = 20
+                val_loss_steps = cfg.eval_steps
                 for _ in range(val_loss_steps):
                     x, y = val_loader.next_batch()
                     x, y = x.to(device), y.to(device)
@@ -469,7 +478,7 @@ if __name__ == '__main__':
                 print(f"validation loss: {val_loss_accum.item():.4f}")
                     
         # generate samples, apparently throws a scary error when used with torch.compile()
-        if (step > 0 and step % 50 == 0) or step == max_steps - 1: # and False: TODO uncomment when using torch.compile() and change 10 to 100
+        if cfg.sample_every and ((step > 0 and step % cfg.sample_every == 0) or step == max_steps - 1): # and False: TODO uncomment when using torch.compile() and change 10 to 100
             model.eval()
             num_return_sequences = 4
             max_length = 32
@@ -527,7 +536,7 @@ if __name__ == '__main__':
             dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
         # clipping the norm according to gpt3's paper, the norm is the length of the vector containing the gradient of all parameters
         # clipping this preserves the direction but stops large magnitude updates from shocking the model, potentially due to bad data within a batch
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
         # get learning rate
         lr = get_lr(step)
         for param_group in optimizer.param_groups: # sets the learning rate for all parameter groups within the optimiser
