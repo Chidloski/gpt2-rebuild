@@ -256,6 +256,24 @@ class DataLoaderLite:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank # strides out the different processes
 
+    def state_dict(self):
+        return {"current_shard": self.current_shard,
+                "current_position": self.current_position,
+                "B": self.B, "T": self.T, "num_processes": self.num_processes}
+
+    def load_state_dict(self, sd):
+        # rank 0 gpu writes the checkpoints, so what is stored is in rank 0's position
+        # must re-add the stride for other ranks
+        if (sd["B"], sd["T"], sd["num_processes"]) != (self.B, self.T, self.num_processes):
+            print(f"WARNING: dataloader geometry has been changed"
+                  f"(ckpt {sd['B']}/{sd['T']}/{sd['num_processes']},"
+                  f"now {self.B}/{self.T}/{self.num_processes})")
+            self.reset()
+            return
+        self.current_shard = sd["current_shard"]
+        self.tokens = load_tokens(self.shards[self.current_shard])
+        self.current_position = sd["current_position"] + self.B * self.T * self.process_rank
+
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
@@ -338,6 +356,38 @@ def build_config_from_cli(argv=None):
     overrides = {f.name: getattr(args, f.name) for f in fields(TrainConfig) if getattr(args, f.name) is not None}
     return replace(cfg, **overrides), overrides
 
+def checkpoint_paths(cfg):
+    run_dir = os.path.join(cfg.out_dir, cfg.run_name)
+    return run_dir, os.path.join(run_dir, "ckpt_last.pt"), os.path.join(run_dir, "log.txt")
+
+def save_checkpoint(path, *, orig_model, optimizer, step, cfg, model_cfg, train_loader, world_size, val_loss):
+    payload = {
+        "step": step,
+        "model": orig_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "train_config": asdict(cfg),
+        "model_config": asdict(model_cfg),
+        "train_loader": train_loader.state_dict(),
+        "world_size": world_size,
+        "val_loss": val_loss,
+    }
+    tmp = path + ".tmp"
+    torch.save(payload, tmp)
+    os.replace(tmp, path)
+
+def resolve_resume(cfg):
+    if not cfg.resume:
+        return None
+    if cfg.resume == "auto":
+        _, last, _ = checkpoint_paths(cfg)
+        return last if os.path.exists(last) else None
+    if not os.path.exists(cfg.resume):
+        raise FileNotFoundError(f"--resume {cfg.resume} does not exist")
+    return cfg.resume
+
+def log_line(path, s):
+    with open(path, "a") as f:
+        f.write(s + "\n")
 
 # --------------------------------------------------------
 if __name__ == '__main__':
@@ -380,6 +430,12 @@ if __name__ == '__main__':
 
     cfg, overrides = build_config_from_cli()
 
+    resume_path = resolve_resume(cfg)
+    ckpt = torch.load(resume_path, map_location="cpu") if resume_path else None
+    run_dir, ckpt_path, log_path = checkpoint_paths(cfg)
+    if master_process:
+        os.makedirs(run_dir, exist_ok=True)
+
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.seed)
@@ -406,11 +462,20 @@ if __name__ == '__main__':
     # this leads to larger but nice computation which in the long run is faster, harmless as adds tokens which aren't found by tokeniser which only has 50257 tokens
     # these extra tokens will never be used and their probability will drop to zero
     gpt_field_names = {f.name for f in fields(GPTConfig)}
-    model_cfg = GPTConfig(**{k: v for k, v in asdict(cfg).items() if k in gpt_field_names})
+    if ckpt is not None:
+        model_cfg = GPTConfig(**ckpt["model_config"])
+        cli_cfg = GPTConfig(**{k: v for k, v in asdict(cfg).items() if k in gpt_field_names})
+        if master_process and model_cfg != cli_cfg:
+            print(f"WARNING: model shape from checkpoint overrides CLI shape\n"
+                  f"    ckpt {model_cfg}\n"
+                  f"    cli: {cli_cfg}")
+    else:
+        model_cfg = GPTConfig(**{k: v for k, v in asdict(cfg).items() if k in gpt_field_names})
     model = GPT(model_cfg)
-
     model.to(device)
     orig_model = model
+    if ckpt is not None:
+        orig_model.load_state_dict(ckpt["model"])
 
     if master_process:
         print(f"config: {cfg}")
@@ -451,7 +516,19 @@ if __name__ == '__main__':
     #optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8) # hyperparams according to gpt3
     optimizer = orig_model.configure_optimizers(weight_decay=cfg.weight_decay, learning_rate=cfg.max_lr, device=device)
 
-    for step in range(max_steps):
+    if ckpt is not None:
+        optimizer.load_state_dict(ckpt["optimizer"])
+
+        train_loader.load_state_dict(ckpt["train_loader"])
+        if ckpt["world_size"] != ddp_world_size and master_process:
+            print(f"WARNING: resuming an {ckpt['world_size']}-process run on {ddp_world_size}")
+        if ckpt["train_config"]["max_steps"] != cfg.max_steps and master_process:
+            print(f"WARNING: mismatch in max steps between cfg ({cfg.max_steps}) and ckpt ({ckpt['train_config']['max_steps']})")
+    start_step = ckpt["step"] + 1 if ckpt is not None else 0
+
+    last_val_loss = None
+
+    for step in range(start_step, max_steps):
         t0 = time.time()
 
         # check validation loss
@@ -476,6 +553,7 @@ if __name__ == '__main__':
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
+                last_val_loss = val_loss_accum.item()
                     
         # generate samples, apparently throws a scary error when used with torch.compile()
         if cfg.sample_every and ((step > 0 and step % cfg.sample_every == 0) or step == max_steps - 1): # and False: TODO uncomment when using torch.compile() and change 10 to 100
@@ -553,7 +631,15 @@ if __name__ == '__main__':
         tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
         tokens_per_sec = tokens_processed / dt
         if master_process:
-            print(f"step {step}, loss: {loss_accum.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, dt: {dt*1000:.2f}ms, tokens_sec: {tokens_per_sec:.2f}hz")
+            msg = (f"step {step}, loss: {loss_accum.item():.6f}, lr: {lr:.4e}, norm: {norm:.4f}, " 
+                   f"dt: {dt*1000:.2f}ms, tokens_sec: {tokens_per_sec:.2f}hz")
+            print(msg)
+            log_line(log_path, msg)
+        if cfg.checkpoint_every and master_process and ((step + 1) % cfg.checkpoint_every == 0 or step == max_steps - 1):
+            save_checkpoint(ckpt_path, orig_model=orig_model, optimizer=optimizer, step=step, cfg=cfg,
+                            model_cfg=model_cfg, train_loader=train_loader, world_size=ddp_world_size, 
+                            val_loss=last_val_loss)
+            print(f"saved checkpoint at step {step} -> {ckpt_path}")
 
     if ddp:
         destroy_process_group()
