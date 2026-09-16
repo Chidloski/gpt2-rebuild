@@ -91,12 +91,10 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, k, freqs_cis)
 
-        k = self.repeat_kv(k, self.n_rep) # fans out the matrix to match the query shape
-        v = self.repeat_kv(v, self.n_rep)
-
         # transform to (4, 12, 64, 64) so heads are at the front
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # scaled dot product attention is able to handle gqa internally
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         # revert to (4, 64, 768)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(y)
@@ -227,9 +225,8 @@ enc = tiktoken.get_encoding('gpt2') # used by the sampling block in the training
 import numpy as np
 
 def load_tokens(filename):
-    npt = np.load(filename)
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
+    # now stays in uint16
+    return np.load(filename)
 
 class DataLoaderLite:
     def __init__(self, B, T, process_rank, num_processes, split, data_root, verbose=False):
@@ -276,7 +273,9 @@ class DataLoaderLite:
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        # only widen B*T+1 tokens to int64, this only widens the tokens that need it rather than the whole shard
+        # each rank only uses its portion of each shard so rather than making each rank widen the whole shard it only widens what is necessary
+        buf = torch.from_numpy(self.tokens[self.current_position : self.current_position+B*T+1].astype(np.int64))
         x = (buf[:-1]).view(B, T) # input data
         y = (buf[1:]).view(B, T) # label / target data
         self.current_position += B * T * self.num_processes
@@ -490,7 +489,7 @@ if __name__ == '__main__':
     if cfg.compile and device_type == 'cuda':
         model = torch.compile(model) # does what it says on the tin, compiles the program so pytorch doesnt have to run in "eager" mode
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+        model = DDP(model, device_ids=[ddp_local_rank], broadcast_buffers=False)
 
     # learning rate scheduler
     max_lr = cfg.max_lr
@@ -569,7 +568,7 @@ if __name__ == '__main__':
             while xgen.size(1) < max_length:
                 # forward the model to get the logits
                 with torch.no_grad():
-                    logits, loss = model(xgen) # (B, T, vocab_size)
+                    logits, loss = orig_model(xgen) # (B, T, vocab_size)
                     # take the logits at the last position
                     logits = logits[:, -1, :] # (B, vocab_size)
                     # get the probabilities
