@@ -63,7 +63,6 @@ class CausalSelfAttention(nn.Module):
 
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
-        self.n_rep = config.n_head // config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
 
         self.wq = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False) # more queries than k or v due to gqa

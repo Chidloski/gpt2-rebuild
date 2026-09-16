@@ -15,10 +15,7 @@ from datasets import load_dataset # pip install datasets
 from tqdm import tqdm # pip install tqdm
 
 # ------------------------------------------
-local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e8)
-target_shards = 100
 
 # init the tokenizer
 # NOTE: everything above and including tokenize() must stay at module level. macOS
