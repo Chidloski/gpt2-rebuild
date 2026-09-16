@@ -72,18 +72,6 @@ class CausalSelfAttention(nn.Module):
         self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
         self.wo.NANOGPT_SCALE_INIT = 1
 
-    def repeat_kv(self, x, n_rep):
-        bs, slen, n_kv_heads, head_dim = x.shape
-        if n_rep == 1:
-            return x
-        # takes 4 kv heads and fans them out into 12
-        # (B, T, 4, 64) -> (B, T, 4, 1, 64)
-        # expand: (B, T, 4, 1, 64) -> (B, T, 4, 3, 64)
-        # reshape: (B, T, 12, 64)
-        return (
-            x[:, :, :, None, :].expand(bs, slen, n_kv_heads, n_rep, head_dim).reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-        )
-
     def forward(self, x, freqs_cis):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
         q = self.wq(x).view(B, T, self.n_head, self.head_dim) # transforms (4, 64, 768) -> (4, 64, 12, 64)
@@ -448,14 +436,11 @@ if __name__ == '__main__':
         if ddp:
             dist.barrier() # all other ranks wait until rank 0 finishes downloading
         hella_df = load_hellaswag() # all other ranks then read the file from cache
-            
 
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(cfg.seed)
 
-    '''# Due to such a large batch size, we must run gradient accumulation to run the batch partly sequentially
-    total_batch_size = 524288 # batch size of 0.5M tokens in accordance with gpt3 paper'''
     total_batch_size = cfg.total_batch_size
     B = cfg.B
     T = cfg.T

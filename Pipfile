@@ -4,11 +4,17 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-dataclasses = "*"
-torch = "*"
-transformers = "*"
+# torch is pinned: enable_gqa in scaled_dot_product_attention needs a recent
+# version, and an older one on a rented image would fail at the first attention call
+torch = "==2.13.0"
+numpy = "*"
 tiktoken = "*"
+# fineweb.py: streams + tokenizes the training shards
 datasets = "*"
+tqdm = "*"
+# hellaswag.py: reads the eval set, which ships as parquet
+pandas = "*"
+pyarrow = "*"
 
 [dev-packages]
 

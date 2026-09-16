@@ -17,8 +17,8 @@ from tqdm import tqdm # pip install tqdm
 # ------------------------------------------
 local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e8) #TODO restore to 1e8 for gpu run # 1M tokens per shard, ~2MB each on disk (uint16)
-target_shards = 100 #TODO change to 10 for gpu run # stop after this many shards (10 x 100M = ~1B tokens, ~2GB)
+shard_size = int(1e8)
+target_shards = 100
 
 # init the tokenizer
 # NOTE: everything above and including tokenize() must stay at module level. macOS
