@@ -14,6 +14,8 @@ venv/
 edu_fineweb10B/
 *.npy
 
+hellaswag/
+
 # run artefacts: checkpoints (~1.8GB each for the 124M model), logs, samples
 log/
 *.pt

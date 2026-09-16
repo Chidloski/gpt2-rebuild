@@ -6,6 +6,7 @@ import math
 import inspect
 import os
 import argparse
+from hellaswag import load_examples as load_hellaswag, evaluate as evaluate_hellaswag
 
 # taken from meta's llama 3 repo
 class RMSNorm(torch.nn.Module):
@@ -307,9 +308,9 @@ class TrainConfig:
     B: int = 16
     T: int = 1024
     # optimisation
-    max_lr: float = 6e-4
+    max_lr: float = 1.8e-3
     min_lr_ratio: float = 0.1
-    warmup_steps: int = 715
+    warmup_steps: int = 200
     max_steps: int = 19073
     weight_decay: float = 0.1
     grad_clip: float = 1.0
@@ -322,15 +323,19 @@ class TrainConfig:
     seed: int = 1337
     compile: bool = True
     resume: str = ""
+    # hellaswag
+    hellaswag_every: int = 1000
+    hellaswag_limit: int = 0 # 0 means all examples
 
 PRESETS = {
     "llama-124m": {}, # default TrainConfig values
     "smoke": dict(run_name="smoke", B=8, total_batch_size=8*1024*4, warmup_steps=10,
-                  max_steps=200, eval_every=50, sample_every=0, checkpoint_every=50),
+                  max_steps=200, eval_every=50, sample_every=0, checkpoint_every=50,
+                  hellaswag_every=0),
     "cpu": dict(run_name="cpu", n_layer=6, n_head=6, n_kv_head=2, n_embd=384,
                 block_size=256, multiple_of=256, total_batch_size=4096, B=8, T=256,
                 warmup_steps=20, max_steps=8000, eval_every=50, sample_every=50,
-                checkpoint_every=100, compile=False),
+                checkpoint_every=100, compile=False, hellaswag_every=0),
 }
 
 def _opt_float(s):
@@ -359,7 +364,7 @@ def checkpoint_paths(cfg):
     run_dir = os.path.join(cfg.out_dir, cfg.run_name)
     return run_dir, os.path.join(run_dir, "ckpt_last.pt"), os.path.join(run_dir, "log.txt")
 
-def save_checkpoint(path, *, orig_model, optimizer, step, cfg, model_cfg, train_loader, world_size, val_loss):
+def save_checkpoint(path, *, orig_model, optimizer, step, cfg, model_cfg, train_loader, world_size, val_loss, hellaswag_acc):
     payload = {
         "step": step,
         "model": orig_model.state_dict(),
@@ -369,6 +374,7 @@ def save_checkpoint(path, *, orig_model, optimizer, step, cfg, model_cfg, train_
         "train_loader": train_loader.state_dict(),
         "world_size": world_size,
         "val_loss": val_loss,
+        "hellaswag_acc": hellaswag_acc,
     }
     tmp = path + ".tmp"
     torch.save(payload, tmp)
@@ -434,6 +440,15 @@ if __name__ == '__main__':
     run_dir, ckpt_path, log_path = checkpoint_paths(cfg)
     if master_process:
         os.makedirs(run_dir, exist_ok=True)
+
+    hella_df = None
+    if cfg.hellaswag_every:
+        if master_process:
+            load_hellaswag() # only rank 0 downloads the file
+        if ddp:
+            dist.barrier() # all other ranks wait until rank 0 finishes downloading
+        hella_df = load_hellaswag() # all other ranks then read the file from cache
+            
 
     torch.manual_seed(cfg.seed)
     if torch.cuda.is_available():
@@ -526,6 +541,7 @@ if __name__ == '__main__':
     start_step = ckpt["step"] + 1 if ckpt is not None else 0
 
     last_val_loss = None
+    last_hella_acc = None
 
     for step in range(start_step, max_steps):
         t0 = time.time()
@@ -553,6 +569,22 @@ if __name__ == '__main__':
             if master_process:
                 print(f"validation loss: {val_loss_accum.item():.4f}")
                 last_val_loss = val_loss_accum.item()
+
+        # hellaswag eval
+        if cfg.hellaswag_every and (step % cfg.hellaswag_every == 0 or step == max_steps - 1):
+            orig_model.eval()
+            nc, nt = evaluate_hellaswag(orig_model, hella_df, device, rank=ddp_rank, world_size=ddp_world_size, 
+                                        limit=cfg.hellaswag_limit or None)
+            nc = torch.tensor(nc, dtype=torch.long, device=device)
+            nt = torch.tensor(nt, dtype=torch.long, device=device)
+            if ddp:
+                dist.all_reduce(nc, op=dist.ReduceOp.SUM)
+                dist.all_reduce(nt, op=dist.ReduceOp.SUM)
+            last_hella_acc = nc.item() / nt.item()
+            if master_process:
+                msg = f"hellaswag: {nc.item()}/{nt.item()} = {last_hella_acc*100:.2f}%"
+                print(msg)
+                log_line(log_path, msg)
                     
         # generate samples, apparently throws a scary error when used with torch.compile()
         if cfg.sample_every and ((step > 0 and step % cfg.sample_every == 0) or step == max_steps - 1): # and False: TODO uncomment when using torch.compile() and change 10 to 100
@@ -637,7 +669,7 @@ if __name__ == '__main__':
         if cfg.checkpoint_every and master_process and ((step + 1) % cfg.checkpoint_every == 0 or step == max_steps - 1):
             save_checkpoint(ckpt_path, orig_model=orig_model, optimizer=optimizer, step=step, cfg=cfg,
                             model_cfg=model_cfg, train_loader=train_loader, world_size=ddp_world_size, 
-                            val_loss=last_val_loss)
+                            val_loss=last_val_loss, hellaswag_acc=last_hella_acc)
             print(f"saved checkpoint at step {step} -> {ckpt_path}")
 
     if ddp:
