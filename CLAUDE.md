@@ -142,13 +142,49 @@ steps the run gets. `B` is purely a performance knob:
 but speed, and `B=64` on 8 GPUs is the ceiling (grad_accum reaches 1). Memory is
 dominated by the `B*T*50304` logits tensor, not the weights.
 
+## Run 1 baseline (2026-09-17)
+
+The first real pretraining run is done. Any future change should be measured against
+these numbers.
+
+| | result |
+|---|---|
+| val loss | **3.0403** |
+| HellaSwag (n=1000) | **34.1%** (peak 34.8%) |
+| step | 19072 (full 10B-token pass) |
+| reference: GPT-2 124M | 29.6% HellaSwag, ~3.29 val |
+| reference: GPT-3 124M | 33.7% HellaSwag |
+
+Config that produced it: `--preset llama-124m --max-lr 1.2e-3 --B 64`, on 2x H100 SXM,
+3.24 hours, ~$23. Artifacts are on the RunPod Global Volume at `/workspace/run1/`
+(`weights.pt`, `ckpt_last.pt`, `log.txt`); `weights.pt` and `run1_log.txt` are also on
+Sam's machine.
+
+Swept before the run, so don't re-derive these:
+
+- **Batch size**: B=16/32/64 gave 794K/864K/886K tok/s. B=64 wins but it is only +2.5%
+  over B=32 — past the saturation knee. B=128 needs ~88GB and OOMs an 80GB card.
+- **Learning rate**: 6e-4 (the GPT-3 paper value the project started with) was clearly
+  worst at 4.03 val; 1.2e-3 and 1.8e-3 tied at ~3.94; 3e-3 was worse *and* unstable
+  (max grad norm 15.96 vs ~3.6). Took 1.2e-3 as the lower of the two tied arms.
+- An untrained model scores **27.4%** on HellaSwag here, so that is the floor, not 25%.
+
+Known-good throughput on 2x H100: **~880K tok/s**, 0.61 s/step including eval,
+HellaSwag, sampling and checkpointing (which together cost only 0.6% of wall-clock).
+
 ## Known gaps
 
 - **Document separation is not implemented.** Deliberately deferred so run 1 stays
   comparable to the nanoGPT baseline; it is intended as run 2's single variable.
   Doing it needs a block-diagonal mask (FlexAttention) *and* per-document RoPE
   position resets — masking alone is half the fix.
-- The DDP path has never executed. `broadcast_buffers=False`, both `all_reduce`
-  calls, `dist.barrier()` and the dataloader stride are untested; a 2-GPU smoke run
-  is mandatory before any 8-GPU run. It cannot be tested locally (macOS gloo cannot
-  complete rendezvous).
+- **Sampling recomputes the whole prefix every token** — the generation loop calls the
+  model on the full growing sequence, which is ~256x wasted work over 500 tokens. A KV
+  cache is the obvious next piece of work.
+- TorchInductor cannot codegen complex operators, so the complex-valued RoPE falls back
+  to eager. Harmless (compile still gives ~55% overall), but a real-valued cos/sin RoPE
+  would close it.
+- DDP *is* verified as of run 1: 1-GPU and 2-GPU runs produced bit-identical loss
+  trajectories, which simultaneously proves the per-rank dataloader stride, the gradient
+  all-reduce and the grad_accum normalisation. Note it cannot be tested locally — macOS
+  gloo cannot complete rendezvous.
