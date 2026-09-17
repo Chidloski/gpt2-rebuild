@@ -4,9 +4,10 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-# torch is pinned: enable_gqa in scaled_dot_product_attention needs a recent
-# version, and an older one on a rented image would fail at the first attention call
-torch = "==2.13.0"
+# floor, not a pin: scaled_dot_product_attention gained enable_gqa in 2.5, and
+# CausalSelfAttention depends on it. Anything from 2.5 up works, which means the
+# stock torch on a rented image is usually fine - preflight.py proves it functionally.
+torch = ">=2.5"
 numpy = "*"
 tiktoken = "*"
 # fineweb.py: streams + tokenizes the training shards

@@ -551,8 +551,10 @@ if __name__ == '__main__':
             if ddp:
                 dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
             if master_process:
-                print(f"validation loss: {val_loss_accum.item():.4f}")
                 last_val_loss = val_loss_accum.item()
+                msg = f"step {step}, validation loss: {last_val_loss:.4f}"
+                print(msg)
+                log_line(log_path, msg)
 
         # hellaswag eval
         if cfg.hellaswag_every and (step % cfg.hellaswag_every == 0 or step == max_steps - 1):
