@@ -7,6 +7,7 @@ import inspect
 import os
 import argparse
 from hellaswag import load_examples as load_hellaswag, evaluate as evaluate_hellaswag
+import contextlib
 
 # taken from meta's llama 3 repo
 class RMSNorm(torch.nn.Module):
@@ -71,7 +72,19 @@ class CausalSelfAttention(nn.Module):
         self.wo = nn.Linear(config.n_head * self.head_dim, config.n_embd, bias=False)
         self.wo.NANOGPT_SCALE_INIT = 1
 
-    def forward(self, x, freqs_cis):
+        self.cache_k = None
+        self.cache_v = None
+
+    def setup_cache(self, max_B, max_T, dtype, device):
+        shape = (max_B, max_T, self.n_kv_head, self.head_dim)
+        self.cache_k = torch.zeros(shape, dtype=dtype, device=device)
+        self.cache_v = torch.zeros(shape, dtype=dtype, device=device)
+
+    def reset_cache(self):
+        self.cache_k = None
+        self.cache_v = None
+
+    def forward(self, x, freqs_cis, start_pos=0):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality
         q = self.wq(x).view(B, T, self.n_head, self.head_dim) # transforms (4, 64, 768) -> (4, 64, 12, 64)
         k = self.wk(x).view(B, T, self.n_kv_head, self.head_dim) # k and v both do (4, 64, 256) -> (4, 64, 4, 64)
@@ -79,10 +92,16 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rotary_emb(q, k, freqs_cis)
 
+        if self.cache_k is not None:
+            self.cache_k[:B, start_pos:start_pos+T] = k
+            self.cache_v[:B, start_pos:start_pos+T] = v
+            k = self.cache_k[:B, :start_pos+T]
+            v = self.cache_v[:B, :start_pos+T]
+
         # transform to (4, 12, 64, 64) so heads are at the front
         q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
         # scaled dot product attention is able to handle gqa internally
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1), enable_gqa=True)
         # revert to (4, 64, 768)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.wo(y)
@@ -117,8 +136,8 @@ class Block(nn.Module):
 
     # forward prop, adds both the attention and mlp back into the token
     # path is purely additive to allow for easier gradient flow
-    def forward(self, x, freqs_cis):
-        x = x + self.attn(self.attention_norm(x), freqs_cis)
+    def forward(self, x, freqs_cis, start_pos=0):
+        x = x + self.attn(self.attention_norm(x), freqs_cis, start_pos)
         x = x + self.mlp(self.ffn_norm(x))
         return x
 
@@ -165,15 +184,15 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, start_pos=0):
         B, T = idx.size()
-        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}"
+        assert start_pos + T <= self.config.block_size, f"Cannot forward sequence of length {T}"
 
         x = self.transformer.wte(idx)
-        freqs_cis = self.freqs_cis[:T]
+        freqs_cis = self.freqs_cis[start_pos : start_pos + T]
 
         for block in self.transformer.h:
-            x = block(x, freqs_cis)
+            x = block(x, freqs_cis, start_pos)
 
         # forward the final layernorm and classifier
         x = self.transformer.norm(x)
@@ -183,6 +202,15 @@ class GPT(nn.Module):
             # flattening B and T to BxT to get two dims (BxT, vocab_size)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
+
+    # caches are allocated per generation based on sequence length and B
+    def setup_caches(self, max_B, max_T, dtype, device):
+        for block in self.transformer.h:
+            block.attn.setup_cache(max_B, max_T, dtype, device)
+
+    def reset_caches(self):
+        for block in self.transformer.h:
+            block.attn.reset_cache()
 
     def configure_optimizers(self, weight_decay, learning_rate, device):
         # all parameters which require grad
@@ -206,6 +234,63 @@ class GPT(nn.Module):
         print(f"Using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
+
+    @staticmethod
+    def _sample_next(logits, temperature, top_k, generator):
+        if temperature == 0.0:
+            return logits.argmax(dim=-1, keepdim=True) # greedy, used for parity testing
+        logits = logits / temperature
+        if top_k is not None:
+            k = min(top_k, logits.size(-1))
+            vals, idxs = torch.topk(logits, k, dim=-1)
+            probs = F.softmax(vals, dim=-1)
+            return torch.gather(idxs, -1, torch.multinomial(probs, 1, generator=generator))
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, 1, generator=generator)
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50,
+                 eos_token=None, generator=None, use_cache=True, autocast_dtype=None):
+        was_training = self.training
+        self.eval()
+
+        B, T = idx.size()
+        max_T = T + max_new_tokens
+        assert max_T <= self.config.block_size, f"prompt ({T}) + new tokens ({max_new_tokens}) exceeds block_size"
+
+        # cache must hold same dtype as forward pass
+        cache_dtype = autocast_dtype or next(self.parameters()).dtype
+        if use_cache:
+            self.setup_caches(B, max_T, cache_dtype, idx.device)
+        ctx = (torch.autocast(device_type=idx.device.type, dtype=autocast_dtype) if autocast_dtype else contextlib.nullcontext())
+
+        finished = torch.zeros(B, dtype=torch.bool, device=idx.device)
+        cur, start = idx, 0
+
+        with ctx:
+            for _ in range(max_new_tokens):
+                logits, _ = self(cur, start_pos=start)
+                start += cur.size(1)
+                next_tok = self._sample_next(logits[:, -1, :], temperature, top_k, generator)
+
+                if eos_token is not None:
+                    # rows that have already stopped will keep emitting eos to keep rectangular shape
+                    next_tok = torch.where(finished.unsqueeze(1), torch.full_like(next_tok, eos_token), next_tok)
+                    finished |= next_tok.squeeze(1) == eos_token
+
+                idx = torch.cat((idx, next_tok), dim=1)
+                if finished.all():
+                    break
+
+                # with cache we only have to feed new token, else we re-feed everything
+                cur = next_tok if use_cache else idx
+                if not use_cache:
+                    start = 0
+
+        self.reset_caches()
+        if was_training:
+            self.train()
+        return idx
 
 # -------------------------------------------------------
 import tiktoken
@@ -574,38 +659,15 @@ if __name__ == '__main__':
                     
         # generate samples, apparently throws a scary error when used with torch.compile()
         if cfg.sample_every and ((step > 0 and step % cfg.sample_every == 0) or step == max_steps - 1): # and False: TODO uncomment when using torch.compile() and change 10 to 100
-            model.eval()
-            num_return_sequences = 4
-            max_length = 32
-            tokens = enc.encode("To be or not to be ")
-            tokens = torch.tensor(tokens, dtype=torch.long)
-            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-            xgen = tokens.to(device)
+            tokens = torch.tensor(enc.encode("In 1945, "), dtype=torch.long)
+            xgen = tokens.unsqueeze(0).repeat(4, 1).to(device)
             sample_rng = torch.Generator(device=device)
             sample_rng.manual_seed(42 + ddp_rank)
-            while xgen.size(1) < max_length:
-                # forward the model to get the logits
-                with torch.no_grad():
-                    logits, loss = orig_model(xgen) # (B, T, vocab_size)
-                    # take the logits at the last position
-                    logits = logits[:, -1, :] # (B, vocab_size)
-                    # get the probabilities
-                    probs = F.softmax(logits, dim=-1)
-                    # do top-k sampling of 50 (huggingface pipeline default)
-                    # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                    # select a token from the top-k probabilities
-                    # note: multinomial does not demand the input to sum to 1
-                    ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                    # gather the corresponding indices
-                    xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                    # append to the sequence
-                    xgen = torch.cat((xgen, xcol), dim=1)
-            # print the generated text
-            for i in range(num_return_sequences):
-                tokens = xgen[i, :max_length].tolist()
-                decoded = enc.decode(tokens)
-                print(f"rank {ddp_rank} sample {i}: {decoded}")
+            out = orig_model.generate(xgen, max_new_tokens=32 - xgen.size(1), top_k=50, generator=sample_rng, 
+                                      autocast_dtype=torch.bfloat16 if use_amp else None)
+
+            for i in range(4):
+                print(f"rank {ddp_rank} sample {i}: {enc.decode(out[i].tolist())}")
 
         # training loop
         model.train()

@@ -176,6 +176,48 @@ def _():
     return ok, f"{n:.1f}M params (expect {EXPECT_PARAMS_M}), ffn={ffn} (expect {EXPECT_FFN})"
 
 
+@check("kv cache parity")
+def _():
+    # the cached decode path must reproduce the full-recompute forward exactly.
+    # weight-free on purpose: this runs on a fresh box before weights.pt exists.
+    # compares logits rather than sampled tokens - a random-init model's argmax is
+    # degenerate enough to hide a broken cache.
+    from dataclasses import asdict, fields
+    import torch
+    from train import GPT, GPTConfig, build_config_from_cli
+    torch.manual_seed(1337)
+    cfg, _ = build_config_from_cli(["--preset", "llama-124m"])
+    names = {f.name for f in fields(GPTConfig)}
+    mc = GPTConfig(**{k: v for k, v in asdict(cfg).items() if k in names})
+    m = GPT(mc).eval()
+
+    B, P, T = 2, 8, 16                      # prefill P tokens, then decode to T
+    x = torch.randint(0, mc.vocab_size, (B, T))
+    with torch.no_grad():
+        ref, _ = m(x)                       # ground truth: one full forward
+
+    def cached_logits(n):                   # prefill + one-token decode, batch size n
+        m.setup_caches(n, T, torch.float32, "cpu")
+        with torch.no_grad():
+            outs = [m(x[:n, :P], start_pos=0)[0]]
+            for i in range(P, T):
+                outs.append(m(x[:n, i:i+1], start_pos=i)[0])
+        m.reset_caches()
+        return torch.cat(outs, dim=1)
+
+    d_cache = (ref - cached_logits(B)).abs().max().item()
+    d_batch = (ref[:1] - cached_logits(1)).abs().max().item()   # B=1 must match row 0 of B=2
+
+    # generate() must leave no cache behind, or the next training step reads stale keys
+    cleared = all(b.attn.cache_k is None and b.attn.cache_v is None for b in m.transformer.h)
+    with torch.no_grad():
+        after, _ = m(x)
+    untouched = torch.equal(ref, after)
+
+    ok = d_cache < 1e-4 and d_batch < 1e-4 and cleared and untouched
+    return ok, (f"logits d={d_cache:.1e}, batch d={d_batch:.1e}, "
+                f"cleared={cleared}, train path untouched={untouched}")
+
 @check("forward + backward on gpu")
 def _():
     from dataclasses import asdict, fields
