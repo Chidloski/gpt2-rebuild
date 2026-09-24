@@ -249,8 +249,9 @@ class GPT(nn.Module):
         return torch.multinomial(probs, 1, generator=generator)
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=50,
-                 eos_token=None, generator=None, use_cache=True, autocast_dtype=None):
+    def generate(self, idx, max_new_tokens, temperature: float = 1.0, top_k: int | None = 50,
+                 eos_token: int | None = None, generator: torch.Generator | None = None, 
+                 use_cache: bool = True, autocast_dtype: torch.dtype | None = None):
         was_training = self.training
         self.eval()
 
