@@ -20,3 +20,6 @@ hellaswag/
 log/
 *.pt
 *.bin
+
+# sft run artefacts (checkpoints, logs); sft_data/ contents are covered by *.npy above
+SFT_log/
