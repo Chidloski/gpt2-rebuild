@@ -19,6 +19,15 @@ The whole pretraining run took **3.2 hours on 2x H100 and cost about $23**.
 
 HellaSwag is scored on the first 1,000 validation examples (±1.5pt noise).
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/run1_dark.png">
+  <img alt="Run 1 training curves. Left: train and validation loss fall from 11.0 to 3.04 over 10B tokens, dropping below GPT-2 124M's 3.29 at 3.0B. Right: HellaSwag accuracy rises from 27.4% untrained to 34.1%, passing GPT-2 124M's 29.6% by the first eval at 0.5B tokens and reaching GPT-3 125M's 33.7% at 2.1B." src="assets/run1_light.png">
+</picture>
+
+Plotted from [`run1_log.txt`](run1_log.txt) by [`assets/plot_run1.py`](assets/plot_run1.py).
+The step in train loss at ~3.07B tokens is a stretch of easier training text ending;
+validation loss is smooth through it.
+
 Two caveats on the comparison. This model is ~23% larger than GPT-2 small (the
 untied `lm_head` alone is 39M parameters). It was also trained on FineWeb-Edu, a
 filtered educational dataset that is known to lift HellaSwag compared with GPT-2's
