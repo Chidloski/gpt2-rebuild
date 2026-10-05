@@ -1,10 +1,10 @@
 # gpt2-rebuild
 
-A language model built from scratch in PyTorch: first GPT-2, then converted step by
-step to the Llama 3 architecture, pretrained on 10B tokens on rented H100s, and
-fine-tuned into a chat model.
+A small language model built first by following nanogpt and thus building a GPT-2 style model
+before converting in to the Llama 3 architecture. It was pretrained on 10B tokens and then 
+fine tuned into a chat model.
 
-The whole pretraining run took **3.2 hours on 2x H100 and cost about $23**.
+Pretraining took around 3.2 hours on 2x H100 and cost about £23.
 
 ## Results
 
@@ -17,13 +17,21 @@ The whole pretraining run took **3.2 hours on 2x H100 and cost about $23**.
 | GPT-3 125M | 125M | 33.7% | — |
 | this model, untrained | 153M | 27.4% | 10.97 |
 
-HellaSwag is scored on the first 1,000 validation examples (±1.5pt noise).
+HellaSwag is scored on the first 1,000 validation examples (thus some noise).
 
-Two caveats on the comparison. This model is ~23% larger than GPT-2 small (the
-untied `lm_head` alone is 39M parameters). It was also trained on FineWeb-Edu, a
-filtered educational dataset that is known to lift HellaSwag compared with GPT-2's
-WebText. The result is "a small modern recipe can match GPT-3 125M for $23", not a
-like-for-like architecture comparison.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/run1_dark.png">
+  <img alt="Run 1 training curves. Left: train and validation loss fall from 11.0 to 3.04 over 10B tokens, dropping below GPT-2 124M's 3.29 at 3.0B. Right: HellaSwag accuracy rises from 27.4% untrained to 34.1%, passing GPT-2 124M's 29.6% by the first eval at 0.5B tokens and reaching GPT-3 125M's 33.7% at 2.1B." src="assets/run1_light.png">
+</picture>
+
+Plotted from [`run1_log.txt`](run1_log.txt) by [`assets/plot_run1.py`](assets/plot_run1.py).
+The step in train loss at ~3.07B tokens is a stretch of easier training text ending;
+validation loss is smooth through it.
+
+Two things to bear in mind. This model is ~23% larger than GPT-2 small (with the
+untied `lm_head` contributing to most of this). It was also trained on FineWeb-Edu
+which is known to lift HellaSwag compared with GPT-2's WebText. The result simply 
+shows how surprising small models can be and taught me a lot about current architecture.
 
 **Chat fine-tuning** (2 epochs on 451K conversations from
 [smol-smoltalk](https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk), 28 min on 1x H100)
@@ -44,9 +52,8 @@ Breathing air,
 In planes, we have no space.
 ```
 
-It handles the format of a conversation well and stops when it should. It's a 153M
-model, so the facts are plausible rather than reliable, and long answers can loop
-under greedy decoding.
+It handles the format of a conversation well and stops when it should. However
+hallucination is a massive problem and it does seem to ramble a little.
 
 ## Architecture
 
