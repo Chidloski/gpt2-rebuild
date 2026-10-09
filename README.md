@@ -89,8 +89,8 @@ Everything after that is my own extension:
   (throughput saturates at B=32–64; B=128 runs out of memory on an 80GB card).
 - **Verification**: [`preflight.py`](preflight.py) runs 16 checks on a fresh GPU box
   before anything expensive starts, including an exact parameter-count assertion.
-  1-GPU and 2-GPU runs produced bit-identical loss curves, which checks the per-rank
-  data sharding, the gradient all-reduce and the accumulation maths together.
+  1-GPU and 2-GPU runs ended at the same loss during test runs, which checks the
+  per-rank data sharding, the gradient all-reduce and the accumulation maths together.
 - **KV cache**: stores keys after RoPE, at GQA width (3x smaller than full multi-head).
   It's verified against the uncached forward pass on logits, not just sampled tokens.
   3.5x faster at 128 generated tokens and 5.1x at 256.
